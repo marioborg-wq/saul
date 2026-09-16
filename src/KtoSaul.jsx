@@ -326,6 +326,46 @@ function computeGradientStops(img, t, bgT) {
   return out;
 }
 
+const hexToRgb = (h) => {
+  const v = String(h || "").replace("#", "");
+  const full = v.length === 3 ? v.split("").map((c) => c + c).join("") : v;
+  const n = parseInt(full, 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+};
+
+const rgbToHsv = (r, g, b) => {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  let h = 0;
+  if (d) {
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h /= 6;
+    if (h < 0) h += 1;
+  }
+  return [h, max ? d / max : 0, max];
+};
+
+const hsvToRgb = (h, s, v) => {
+  const i = Math.floor(h * 6), f = h * 6 - i;
+  const p = v * (1 - s), q = v * (1 - f * s), tt = v * (1 - (1 - f) * s);
+  const [r, g, b] = [[v, tt, p], [q, v, p], [p, v, tt], [p, q, v], [tt, p, v], [v, p, q]][((i % 6) + 6) % 6];
+  return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+};
+
+/* On a flat colour the scrim just needs to darken toward the bottom in the
+ * same hue. The image sampler's saturation boost is wrong here: applied to a
+ * near-grey like #161616 it invents a hue and tints the scrim brown. */
+function stopsFromColor(hexStr) {
+  const [r, g, b] = hexToRgb(hexStr);
+  const [h, sat, val] = rgbToHsv(r, g, b);
+  return {
+    top: [r, g, b],
+    bot: hsvToRgb(h, Math.min(1, sat * 1.1), val * 0.5),
+  };
+}
+
 const rgbStr = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
 const hex = (c) => "#" + c.map((v) => v.toString(16).padStart(2, "0")).join("");
 
@@ -384,6 +424,100 @@ const safeFilename = (s) =>
     .slice(0, 80);
 
 
+
+/* ---------------------- background removal ------------------------ */
+/* Runs in the browser on the real artwork — nothing is uploaded and no
+ * model is involved, so the licensed game art is preserved exactly rather
+ * than redrawn by a generative model.
+ *
+ * Flood fills inward from the image border, clearing pixels within
+ * `tolerance` of the border colour. Game tiles and promo renders almost
+ * always sit on a flat or near-flat backdrop, which is exactly the case this
+ * handles well. Busy photographic backdrops are the case it does not — the
+ * user can undo and supply a proper cut-out. */
+
+function removeBackground(img, tolerance = 24, feather = 1.2) {
+  const W = img.naturalWidth || img.width;
+  const H = img.naturalHeight || img.height;
+  const cv = document.createElement("canvas");
+  cv.width = W;
+  cv.height = H;
+  const ctx = cv.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, W, H);
+
+  const id = ctx.getImageData(0, 0, W, H);
+  const d = id.data;
+
+  // seed colour: average of the border ring, ignoring anything already clear
+  let sr = 0, sg = 0, sb = 0, n = 0;
+  const sample = (x, y) => {
+    const i = (y * W + x) * 4;
+    if (d[i + 3] < 10) return;
+    sr += d[i]; sg += d[i + 1]; sb += d[i + 2]; n++;
+  };
+  for (let x = 0; x < W; x++) { sample(x, 0); sample(x, H - 1); }
+  for (let y = 0; y < H; y++) { sample(0, y); sample(W - 1, y); }
+  if (n) { sr /= n; sg /= n; sb /= n; }
+
+  const tol2 = tolerance * tolerance * 3;
+  const mask = new Uint8Array(W * H); // 1 = background
+  const queue = new Int32Array(W * H);
+  let head = 0, tail = 0;
+
+  const consider = (p) => {
+    if (mask[p]) return;
+    const i = p * 4;
+    if (d[i + 3] < 10) { mask[p] = 1; queue[tail++] = p; return; }
+    const dr = d[i] - sr, dg = d[i + 1] - sg, db = d[i + 2] - sb;
+    if (dr * dr + dg * dg + db * db <= tol2) { mask[p] = 1; queue[tail++] = p; }
+  };
+
+  for (let x = 0; x < W; x++) { consider(x); consider((H - 1) * W + x); }
+  for (let y = 0; y < H; y++) { consider(y * W); consider(y * W + W - 1); }
+
+  while (head < tail) {
+    const p = queue[head++];
+    const x = p % W, y = (p / W) | 0;
+    if (x > 0) consider(p - 1);
+    if (x < W - 1) consider(p + 1);
+    if (y > 0) consider(p - W);
+    if (y < H - 1) consider(p + W);
+  }
+
+  // soften the cut so the edge does not alias against the background
+  const alpha = new Float32Array(W * H);
+  for (let p = 0; p < W * H; p++) alpha[p] = mask[p] ? 0 : d[p * 4 + 3] / 255;
+  if (feather > 0) {
+    const r = Math.max(1, Math.round(feather));
+    const tmp = new Float32Array(W * H);
+    for (let y = 0; y < H; y++)
+      for (let x = 0; x < W; x++) {
+        let sum = 0, c = 0;
+        for (let k = -r; k <= r; k++) {
+          const xx = x + k;
+          if (xx < 0 || xx >= W) continue;
+          sum += alpha[y * W + xx]; c++;
+        }
+        tmp[y * W + x] = sum / c;
+      }
+    for (let y = 0; y < H; y++)
+      for (let x = 0; x < W; x++) {
+        let sum = 0, c = 0;
+        for (let k = -r; k <= r; k++) {
+          const yy = y + k;
+          if (yy < 0 || yy >= H) continue;
+          sum += tmp[yy * W + x]; c++;
+        }
+        alpha[y * W + x] = sum / c;
+      }
+  }
+  for (let p = 0; p < W * H; p++) d[p * 4 + 3] = Math.round(alpha[p] * 255);
+
+  ctx.putImageData(id, 0, 0);
+  const cleared = mask.reduce((a, b) => a + b, 0) / (W * H);
+  return { dataUrl: cv.toDataURL("image/png"), cleared };
+}
+
 /* ------------------------- saved assets --------------------------- */
 /* One key per asset (images make them large) plus a light index the
  * Library grid can read in a single call. */
@@ -417,10 +551,15 @@ function renderThumbnail(ctx, t, S, st, preview) {
   ctx.fillRect(0, 0, W, H);
 
   // Background
+  if (st.bgSolid) {
+    ctx.fillStyle = st.bgColor;
+    ctx.fillRect(0, 0, W, H);
+  }
+
   if (st.bgImg) {
-    // below 100% the image no longer covers the frame, so fill the gap with a
-    // blurred, darkened copy of itself rather than leaving bare canvas
-    if (st.bg.scale < 1) {
+    // below 100% the image no longer covers the frame. With a solid colour set
+    // that colour fills the gap; otherwise use a blurred copy of the image.
+    if (st.bg.scale < 1 && !st.bgSolid) {
       ctx.save();
       try {
         ctx.filter = `blur(${Math.round(16 * S)}px) brightness(0.55)`;
@@ -429,7 +568,7 @@ function renderThumbnail(ctx, t, S, st, preview) {
       ctx.restore();
     }
     drawCoverClipped(ctx, st.bgImg, 0, 0, W, H, st.bg.scale, st.bg.x, st.bg.y);
-  } else {
+  } else if (!st.bgSolid) {
     const g = ctx.createLinearGradient(0, 0, W, H);
     g.addColorStop(0, "#2b2b2b");
     g.addColorStop(1, "#151515");
@@ -993,7 +1132,9 @@ export default function KtoSaul() {
 
   const [texts, setTexts] = useState({ gameName: "GAME", gameLine1: "GAME", gameLine2: "GAME", gameLine3: "GAME", provider: "PROVIDER" });
   const [bgImg, setBgImg] = useState(null);
-  const [fgs, setFgs] = useState([{ img: null, scale: 1, x: 0, y: 0, rotate: 0 }]);
+  const [bgSolid, setBgSolid] = useState(false);
+  const [bgColor, setBgColor] = useState("#161616");
+  const [fgs, setFgs] = useState([{ img: null, orig: null, cut: false, tol: 24, scale: 1, x: 0, y: 0, rotate: 0 }]);
   const [bg, setBg] = useState({ scale: 1, x: 0, y: 0 });
   const [gradientOn, setGradientOn] = useState(true);
   const [gradientMode, setGradientMode] = useState("auto");
@@ -1059,9 +1200,11 @@ export default function KtoSaul() {
 
   // recompute the auto gradient whenever the visible background changes
   useEffect(() => {
-    if (!bgImg || !live) return setStops(null);
-    setStops(computeGradientStops(bgImg, t, bg));
-  }, [bgImg, bg.scale, bg.x, bg.y, templateId]);
+    if (!live) return setStops(null);
+    if (bgImg) return setStops(computeGradientStops(bgImg, t, bg));
+    if (bgSolid) return setStops(stopsFromColor(bgColor));
+    setStops(null);
+  }, [bgImg, bg.scale, bg.x, bg.y, templateId, bgSolid, bgColor, live]);
 
   const nameKeys = t.nameKeys || ["gameName"];
   const fullGameName = nameKeys.map((k) => texts[k]).filter(Boolean).join(" ");
@@ -1069,6 +1212,8 @@ export default function KtoSaul() {
   const st = {
     texts,
     bgImg,
+    bgSolid,
+    bgColor,
     fgs,
     bg,
     gradientOn,
@@ -1093,7 +1238,9 @@ export default function KtoSaul() {
   const resetAll = () => {
     setBgImg(null);
     setBg({ scale: 1, x: 0, y: 0 });
-    setFgs([{ img: null, scale: 1, x: 0, y: 0, rotate: 0 }]);
+    setBgSolid(false);
+    setBgColor("#161616");
+    setFgs([{ img: null, orig: null, cut: false, tol: 24, scale: 1, x: 0, y: 0, rotate: 0 }]);
     setStops(null);
     setGradientOn(true);
     setGradientMode("auto");
@@ -1133,8 +1280,17 @@ export default function KtoSaul() {
         templateId,
         category,
         texts,
-        bg: { scale: bg.scale, x: bg.x, y: bg.y, src: bgImg ? bgImg.src : null },
-        fgs: fgs.map((l) => ({ scale: l.scale, x: l.x, y: l.y, rotate: l.rotate || 0, src: l.img ? l.img.src : null })),
+        bg: { scale: bg.scale, x: bg.x, y: bg.y, src: bgImg ? bgImg.src : null, solid: bgSolid, color: bgColor },
+        fgs: fgs.map((l) => ({
+          scale: l.scale,
+          x: l.x,
+          y: l.y,
+          rotate: l.rotate || 0,
+          src: l.img ? l.img.src : null,
+          origSrc: l.orig ? l.orig.src : null,
+          cut: !!l.cut,
+          tol: l.tol || 24,
+        })),
         gradient: { on: gradientOn, mode: gradientMode, opacity: gradientOpacity },
       };
       await window.storage.set(assetKey(id), JSON.stringify(payload));
@@ -1167,18 +1323,26 @@ export default function KtoSaul() {
       setGradientMode(a.gradient?.mode ?? "auto");
       setGradientOpacity(a.gradient?.opacity ?? 1);
       setBg({ scale: a.bg.scale, x: a.bg.x, y: a.bg.y });
+      setBgSolid(!!a.bg.solid);
+      setBgColor(a.bg.color || "#161616");
       setBgImg(null);
       if (a.bg.src) {
         const img = new Image();
         img.onload = () => setBgImg(img);
         img.src = a.bg.src;
       }
-      setFgs(a.fgs.map((l) => ({ img: null, scale: l.scale, x: l.x, y: l.y, rotate: l.rotate })));
+      setFgs(a.fgs.map((l) => ({ img: null, orig: null, cut: !!l.cut, tol: l.tol || 24, scale: l.scale, x: l.x, y: l.y, rotate: l.rotate })));
       a.fgs.forEach((l, i) => {
-        if (!l.src) return;
-        const img = new Image();
-        img.onload = () => setFgs((prev) => prev.map((p, n) => (n === i ? { ...p, img } : p)));
-        img.src = l.src;
+        if (l.src) {
+          const img = new Image();
+          img.onload = () => setFgs((prev) => prev.map((p, n) => (n === i ? { ...p, img } : p)));
+          img.src = l.src;
+        }
+        if (l.origSrc) {
+          const o = new Image();
+          o.onload = () => setFgs((prev) => prev.map((p, n) => (n === i ? { ...p, orig: o } : p)));
+          o.src = l.origSrc;
+        }
       });
       setAssetId(id);
       if (name) setAssetName(name);
@@ -1206,10 +1370,33 @@ export default function KtoSaul() {
     refreshLibrary();
   };
 
+  const [cutBusy, setCutBusy] = useState(null);
+
+  const applyCutout = (i, tolerance) => {
+    const layer = fgs[i];
+    const source = layer.orig || layer.img;
+    if (!source) return;
+    setCutBusy(i);
+    // let the button state paint before the synchronous flood fill
+    setTimeout(() => {
+      try {
+        const { dataUrl, cleared } = removeBackground(source, tolerance);
+        const img = new Image();
+        img.onload = () => {
+          patchFg(i, { img, orig: source, cut: true, tol: tolerance, cleared });
+          setCutBusy(null);
+        };
+        img.src = dataUrl;
+      } catch (e) {
+        setCutBusy(null);
+      }
+    }, 30);
+  };
+
   const MAX_FG = 3;
   const patchFg = (i, patch) => setFgs((prev) => prev.map((l, n) => (n === i ? { ...l, ...patch } : l)));
   const addFg = () =>
-    setFgs((prev) => (prev.length >= MAX_FG ? prev : [...prev, { img: null, scale: 1, x: 0, y: 0, rotate: 0 }]));
+    setFgs((prev) => (prev.length >= MAX_FG ? prev : [...prev, { img: null, orig: null, cut: false, tol: 24, scale: 1, x: 0, y: 0, rotate: 0 }]));
   const moveFg = (i, delta) =>
     setFgs((prev) => {
       const j = i + delta;
@@ -1219,7 +1406,7 @@ export default function KtoSaul() {
       return next;
     });
   const removeFg = (i) =>
-    setFgs((prev) => (prev.length === 1 ? [{ img: null, scale: 1, x: 0, y: 0, rotate: 0 }] : prev.filter((l, n) => n !== i)));
+    setFgs((prev) => (prev.length === 1 ? [{ img: null, orig: null, cut: false, tol: 24, scale: 1, x: 0, y: 0, rotate: 0 }] : prev.filter((l, n) => n !== i)));
 
   const loadFile = (file, setter) => {
     const reader = new FileReader();
@@ -1567,12 +1754,67 @@ export default function KtoSaul() {
           </Section>
 
           <Section title="Background">
-            <Uploader label="Background (JPG or PNG)" img={bgImg} onFile={(f) => loadFile(f, setBgImg)} onClear={() => { setBgImg(null); setBg({ scale: 1, x: 0, y: 0 }); }} />
+            <Uploader
+              label="Background (JPG or PNG)"
+              img={bgImg}
+              onFile={(f) => loadFile(f, setBgImg)}
+              onClear={() => {
+                setBgImg(null);
+                setBg({ scale: 1, x: 0, y: 0 });
+              }}
+            />
+
+            <Checkbox label="Solid colour" checked={bgSolid} onChange={setBgSolid} />
+
+            {bgSolid ? (
+              <div className="flex flex-col gap-2.5">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="color"
+                    value={bgColor}
+                    onChange={(e) => setBgColor(e.target.value)}
+                    style={{ background: C.panel2, border: `1px solid ${C.line}`, width: 40, height: 32, padding: 2 }}
+                    className="shrink-0 cursor-pointer rounded"
+                  />
+                  <input
+                    value={bgColor}
+                    onChange={(e) => {
+                      const v = e.target.value.startsWith("#") ? e.target.value : `#${e.target.value}`;
+                      setBgColor(v);
+                    }}
+                    onBlur={(e) => {
+                      // snap back if what they typed is not a colour
+                      if (!/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(e.target.value)) setBgColor("#161616");
+                    }}
+                    spellCheck={false}
+                    style={{ background: C.panel2, border: `1px solid ${C.line}`, color: C.text }}
+                    className="min-w-0 flex-1 rounded px-2.5 py-2 text-sm uppercase outline-none"
+                  />
+                </div>
+                <div className="flex gap-1.5">
+                  {["#161616", "#000000", "#da0000", "#00dd70", "#fad749", "#ffffff"].map((c) => (
+                    <button
+                      key={c}
+                      onClick={() => setBgColor(c)}
+                      title={c}
+                      style={{
+                        background: c,
+                        border: `1px solid ${C.line}`,
+                        outline: bgColor.toLowerCase() === c ? `2px solid ${C.text}` : "none",
+                        outlineOffset: 2,
+                      }}
+                      className="h-6 w-6 rounded"
+                    />
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
             {bgImg && (
               <>
-                <Slider label="Size" value={bg.scale} min={0.3} max={2.5} step={0.01} onChange={(v) => setBg({ ...bg, scale: v })} format={(v) => `${Math.round(v * 100)}%`} />
-                <Slider label="Position X" value={bg.x} min={-0.6} max={0.6} step={0.005} onChange={(v) => setBg({ ...bg, x: v })} format={(v) => v.toFixed(2)} />
-                <Slider label="Position Y" value={bg.y} min={-0.6} max={0.6} step={0.005} onChange={(v) => setBg({ ...bg, y: v })} format={(v) => v.toFixed(2)} />
+                  <Slider label="Size" value={bg.scale} min={0.3} max={2.5} step={0.01} onChange={(v) => setBg({ ...bg, scale: v })} format={(v) => `${Math.round(v * 100)}%`} />
+                  <Slider label="Position X" value={bg.x} min={-0.6} max={0.6} step={0.005} onChange={(v) => setBg({ ...bg, x: v })} format={(v) => v.toFixed(2)} />
+                  <Slider label="Position Y" value={bg.y} min={-0.6} max={0.6} step={0.005} onChange={(v) => setBg({ ...bg, y: v })} format={(v) => v.toFixed(2)} />
               </>
             )}
           </Section>
@@ -1600,8 +1842,8 @@ export default function KtoSaul() {
                 <Uploader
                   label={fgs.length > 1 ? `Foreground ${i + 1} (PNG)` : "Foreground (PNG)"}
                   img={layer.img}
-                  onFile={(file) => loadFile(file, (img) => patchFg(i, { img }))}
-                  onClear={() => patchFg(i, { img: null, scale: 1, x: 0, y: 0, rotate: 0 })}
+                  onFile={(file) => loadFile(file, (img) => patchFg(i, { img, orig: img, cut: false, tol: 24 }))}
+                  onClear={() => patchFg(i, { img: null, orig: null, cut: false, tol: 24, scale: 1, x: 0, y: 0, rotate: 0 })}
                   actions={
                     fgs.length > 1 ? (
                       <>
@@ -1621,6 +1863,40 @@ export default function KtoSaul() {
                 />
                 {layer.img && (
                   <>
+                    {!layer.cut ? (
+                      <button
+                        onClick={() => applyCutout(i, 24)}
+                        disabled={cutBusy === i}
+                        style={{ color: cutBusy === i ? C.dim2 : C.yellow }}
+                        className="text-left text-xs"
+                      >
+                        {cutBusy === i ? "Removing background…" : "Remove background"}
+                      </button>
+                    ) : (
+                      <div className="flex flex-col gap-2">
+                        <Slider
+                          label="Cut-out tolerance"
+                          value={layer.tol}
+                          min={4}
+                          max={80}
+                          step={1}
+                          onChange={(v) => applyCutout(i, v)}
+                          format={(v) => v}
+                        />
+                        {layer.cleared > 0.97 && (
+                          <span style={{ color: C.yellow }} className="text-xs leading-snug">
+                            Almost everything was removed — lower the tolerance
+                          </span>
+                        )}
+                        <button
+                          onClick={() => patchFg(i, { img: layer.orig, cut: false })}
+                          style={{ color: C.dim }}
+                          className="text-left text-xs underline"
+                        >
+                          Restore original
+                        </button>
+                      </div>
+                    )}
                     <Slider label="Size" value={layer.scale} min={0.2} max={3} step={0.01} onChange={(v) => patchFg(i, { scale: v })} format={(v) => `${Math.round(v * 100)}%`} />
                     <Slider label="Position X" value={layer.x} min={-0.6} max={0.6} step={0.005} onChange={(v) => patchFg(i, { x: v })} format={(v) => v.toFixed(2)} />
                     <Slider label="Position Y" value={layer.y} min={-0.6} max={0.6} step={0.005} onChange={(v) => patchFg(i, { y: v })} format={(v) => v.toFixed(2)} />

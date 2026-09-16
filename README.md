@@ -76,6 +76,29 @@ artwork this returns `#bc4f00` against the designer's hand-picked `#b75702`.
 
 It re-samples whenever the background image, size or position changes.
 
+### Background removal (cut-out)
+
+If a user has the game art but no transparent PNG, **Remove background** on any
+foreground layer produces one in the browser.
+
+It flood fills inward from the image border, clearing pixels within a tolerance
+of the border colour, then feathers the resulting alpha edge. It is deliberately
+not a generative model: the licensed provider artwork is preserved exactly
+rather than redrawn, and nothing leaves the machine — no API key, no upload, no
+model download. That matters for unreleased game art.
+
+Tolerance defaults to 24. Measured against real game art on four backdrops,
+24 keeps 99.5%+ of the subject even when the backdrop colour is close to
+colours inside the artwork; at 36 that adversarial case starts eating the
+subject. The slider re-runs live, and the original is kept so **Restore
+original** is always available. A warning appears if a run clears more than 97%
+of the image, which means the fill has leaked through the subject.
+
+It suits flat or near-flat backdrops, which covers most supplied renders and
+tiles. It will not cope with busy photographic backdrops — there the answer is
+a properly cut PNG, or a segmentation model (`@imgly/background-removal` runs
+client-side; a hosted API would need a server-side proxy and a vendor review).
+
 ### Saving
 
 Saved assets are stored as:
