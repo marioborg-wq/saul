@@ -999,6 +999,8 @@ export default function KtoSaul() {
   const [gradientMode, setGradientMode] = useState("auto");
   const [gradientOpacity, setGradientOpacity] = useState(1);
   const [stops, setStops] = useState(null);
+  // not displayed, but flipping it forces the canvas to redraw once Barlow has
+  // loaded — otherwise the first paint measures a fallback font
   const [fontsReady, setFontsReady] = useState(false);
   const [format, setFormat] = useState(t.exportDefaults?.format || "png");
   const [exportScale, setExportScale] = useState(t.exportDefaults?.scale || 1);
@@ -1531,7 +1533,9 @@ export default function KtoSaul() {
             style={{ borderTop: `1px solid ${C.line}`, background: C.panel, color: C.dim2 }}
             className="flex shrink-0 items-center justify-between px-4 py-2 text-xs"
           >
-            <span>{fontsReady ? "Barlow Black 72 · Barlow Medium 20" : "Loading Barlow…"}</span>
+            <span>
+              {t.w}×{t.h} @1x
+            </span>
             {stops && gradientOn && gradientMode === "auto" && (
               <span className="flex items-center gap-2">
                 Auto gradient
